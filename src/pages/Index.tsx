@@ -1,169 +1,177 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
-const W = 800;
-const H = 500;
-const PLAYER_SPEED = 4;
-const BULLET_SPEED = 9;
-const ENEMY_BASE_SPEED = 1.2;
+const W = 960;
+const H = 540;
+const FOV = Math.PI / 3;
+const NUM_RAYS = 240;
+const MAX_DEPTH = 20;
+const CELL = 1;
+const PLAYER_SPEED = 0.055;
+const PLAYER_TURN = 0.035;
+
+// Map: 1 = wall A (concrete), 2 = wall B (crate), 3 = wall C (metal), 0 = floor
+const MAP: number[][] = [
+  [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,2,2,0,0,0,0,3,3,0,0,0,0,0,0,0,0,1],
+  [1,0,0,2,0,0,0,0,0,0,0,0,0,0,2,2,0,0,0,1],
+  [1,0,0,0,0,0,0,1,1,1,1,0,0,0,0,2,0,0,0,1],
+  [1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,3,3,0,0,0,0,0,0,0,0,0,0,0,0,2,2,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,2,2,0,0,0,0,1,0,0,0,0,3,0,0,1],
+  [1,0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,3,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,1],
+  [1,0,0,0,3,3,0,0,0,0,0,0,0,1,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,2,2,0,0,0,0,0,0,0,2,0,1],
+  [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+];
+const MH = MAP.length;
+const MW = MAP[0].length;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
-interface Vec2 { x: number; y: number; }
-
-interface Player {
-  x: number; y: number;
-  w: number; h: number;
+interface Enemy {
+  id: number; x: number; y: number;
   hp: number; maxHp: number;
-  ammo: number; maxAmmo: number;
-  reloading: boolean; reloadTimer: number;
-  shootCooldown: number;
-  shield: number;
-  score: number;
-  kills: number;
+  alive: boolean;
+  shootTimer: number;
+  state: "patrol" | "chase" | "shoot";
+  deathTimer: number;
 }
 
 interface Bullet {
-  id: number; x: number; y: number;
-  vx: number; vy: number;
-  friendly: boolean;
-  dmg: number;
-  r: number;
-}
-
-interface Enemy {
-  id: number; x: number; y: number;
-  w: number; h: number;
-  hp: number; maxHp: number;
-  speed: number;
-  vx: number; vy: number;
-  type: "grunt" | "tank" | "fast" | "boss";
-  shootTimer: number; shootRate: number;
-  reward: number;
-  color: string;
-}
-
-interface Particle {
-  id: number; x: number; y: number;
-  vx: number; vy: number;
-  life: number; maxLife: number;
-  r: number; color: string;
+  x: number; y: number;
+  age: number;
 }
 
 interface GameState {
-  phase: "menu" | "playing" | "paused" | "dead" | "wave_clear";
-  wave: number;
-  waveTimer: number;
-  spawnQueue: number;
-  spawnTimer: number;
-  totalScore: number;
+  phase: "menu" | "playing" | "dead" | "victory";
+  score: number;
+  kills: number;
+  round: number;
+  money: number;
+}
+
+interface PlayerState {
+  x: number; y: number; angle: number;
+  hp: number; armor: number;
+  ammo: number; maxAmmo: number;
+  reserve: number;
+  reloading: boolean; reloadT: number;
+  shootCd: number;
+  recoil: number;
+  bob: number;
+  hitFlash: number;
+  muzzleFlash: number;
+  weapon: "ak47" | "awp" | "glock";
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-let nextId = 1;
-const uid = () => nextId++;
-
-function rect(ax: number, ay: number, aw: number, ah: number, bx: number, by: number, bw: number, bh: number) {
-  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+function mapAt(x: number, y: number): number {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  if (ix < 0 || ix >= MW || iy < 0 || iy >= MH) return 1;
+  return MAP[iy][ix];
 }
 
-function spawnEnemy(wave: number): Enemy {
-  const side = Math.floor(Math.random() * 4);
-  let x = 0, y = 0;
-  if (side === 0) { x = Math.random() * W; y = -40; }
-  else if (side === 1) { x = W + 40; y = Math.random() * H; }
-  else if (side === 2) { x = Math.random() * W; y = H + 40; }
-  else { x = -40; y = Math.random() * H; }
+function wallColor(t: number, side: number, dark: boolean): string {
+  let r = 120, g = 120, b = 120;
+  if (t === 1) { r = 110; g = 100; b = 88; }       // concrete
+  else if (t === 2) { r = 150; g = 100; b = 50; }  // wood crate
+  else if (t === 3) { r = 90; g = 110; b = 130; }  // metal
+  if (side === 1) { r *= 0.7; g *= 0.7; b *= 0.7; }
+  if (dark) { r *= 0.6; g *= 0.6; b *= 0.6; }
+  return `rgb(${r|0},${g|0},${b|0})`;
+}
 
-  const roll = Math.random();
-  const isBoss = wave % 5 === 0 && Math.random() < 0.15;
-
-  if (isBoss) {
-    return { id: uid(), x, y, w: 52, h: 52, hp: 400 + wave * 60, maxHp: 400 + wave * 60,
-      speed: 0.7, vx: 0, vy: 0, type: "boss", shootTimer: 0, shootRate: 80,
-      reward: 500, color: "#ff2020" };
-  } else if (roll < 0.2) {
-    return { id: uid(), x, y, w: 36, h: 36, hp: 80 + wave * 15, maxHp: 80 + wave * 15,
-      speed: 0.8, vx: 0, vy: 0, type: "tank", shootTimer: 0, shootRate: 120,
-      reward: 80, color: "#e67e22" };
-  } else if (roll < 0.4) {
-    return { id: uid(), x, y, w: 22, h: 22, hp: 25 + wave * 5, maxHp: 25 + wave * 5,
-      speed: ENEMY_BASE_SPEED * 2.2 + wave * 0.1, vx: 0, vy: 0, type: "fast",
-      shootTimer: 0, shootRate: 999, reward: 30, color: "#2ecc71" };
-  } else {
-    return { id: uid(), x, y, w: 28, h: 28, hp: 40 + wave * 10, maxHp: 40 + wave * 10,
-      speed: ENEMY_BASE_SPEED + wave * 0.08, vx: 0, vy: 0, type: "grunt",
-      shootTimer: 0, shootRate: 150, reward: 20, color: "#e74c3c" };
+// DDA raycasting
+function castRay(px: number, py: number, angle: number): { dist: number; wallType: number; side: number; hitX: number } {
+  const dx = Math.cos(angle), dy = Math.sin(angle);
+  let mapX = Math.floor(px), mapY = Math.floor(py);
+  const deltaX = Math.abs(1 / dx), deltaY = Math.abs(1 / dy);
+  let stepX: number, stepY: number, sideDistX: number, sideDistY: number;
+  if (dx < 0) { stepX = -1; sideDistX = (px - mapX) * deltaX; }
+  else { stepX = 1; sideDistX = (mapX + 1 - px) * deltaX; }
+  if (dy < 0) { stepY = -1; sideDistY = (py - mapY) * deltaY; }
+  else { stepY = 1; sideDistY = (mapY + 1 - py) * deltaY; }
+  let side = 0, hit = 0, t = 0;
+  for (let i = 0; i < 64; i++) {
+    if (sideDistX < sideDistY) { sideDistX += deltaX; mapX += stepX; side = 0; }
+    else { sideDistY += deltaY; mapY += stepY; side = 1; }
+    t = MAP[mapY]?.[mapX] ?? 1;
+    if (t > 0) { hit = 1; break; }
+    if (Math.abs(mapX - px) > MAX_DEPTH || Math.abs(mapY - py) > MAX_DEPTH) break;
   }
+  const dist = side === 0 ? (mapX - px + (1 - stepX) / 2) / dx : (mapY - py + (1 - stepY) / 2) / dy;
+  const hitX = side === 0 ? py + dist * dy : px + dist * dx;
+  return { dist: Math.max(0.01, dist), wallType: hit ? t : 1, side, hitX: hitX - Math.floor(hitX) };
 }
 
-function makeParticles(x: number, y: number, color: string, count = 8): Particle[] {
-  return Array.from({ length: count }, () => ({
-    id: uid(), x, y,
-    vx: (Math.random() - 0.5) * 6,
-    vy: (Math.random() - 0.5) * 6,
-    life: 30 + Math.random() * 20,
-    maxLife: 50,
-    r: 2 + Math.random() * 4,
-    color,
-  }));
-}
-
-// ─── Draw helpers ────────────────────────────────────────────────────────────
-function drawRoundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-}
-
-// ─── Game Component ──────────────────────────────────────────────────────────
+// ─── Component ──────────────────────────────────────────────────────────────
 export default function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const stateRef = useRef<GameState>({
-    phase: "menu", wave: 1, waveTimer: 0, spawnQueue: 0, spawnTimer: 0, totalScore: 0,
+  const playerRef = useRef<PlayerState>({
+    x: 2.5, y: 2.5, angle: 0,
+    hp: 100, armor: 100,
+    ammo: 30, maxAmmo: 30, reserve: 90,
+    reloading: false, reloadT: 0,
+    shootCd: 0, recoil: 0, bob: 0,
+    hitFlash: 0, muzzleFlash: 0,
+    weapon: "ak47",
   });
-  const playerRef = useRef<Player>({
-    x: W / 2 - 16, y: H / 2 - 16,
-    w: 32, h: 32,
-    hp: 100, maxHp: 100,
-    ammo: 30, maxAmmo: 30,
-    reloading: false, reloadTimer: 0,
-    shootCooldown: 0,
-    shield: 0,
-    score: 0, kills: 0,
-  });
-  const bulletsRef = useRef<Bullet[]>([]);
+  const stateRef = useRef<GameState>({ phase: "menu", score: 0, kills: 0, round: 1, money: 800 });
   const enemiesRef = useRef<Enemy[]>([]);
-  const particlesRef = useRef<Particle[]>([]);
+  const bulletsRef = useRef<Bullet[]>([]);
   const keysRef = useRef<Record<string, boolean>>({});
-  const mouseRef = useRef<Vec2>({ x: W / 2, y: H / 2 });
   const mouseDownRef = useRef(false);
+  const mouseDxRef = useRef(0);
+  const pointerLockedRef = useRef(false);
   const frameRef = useRef(0);
-  const [ui, setUi] = useState({ phase: "menu" as GameState["phase"], wave: 1, score: 0 });
-  const [highScore, setHighScore] = useState(() => {
-    try { return parseInt(localStorage.getItem("fol_hs") || "0"); } catch { return 0; }
+  const zBufferRef = useRef<number[]>(new Array(NUM_RAYS).fill(MAX_DEPTH));
+
+  const [ui, setUi] = useState({ phase: "menu" as GameState["phase"], hp: 100, armor: 100, ammo: 30, reserve: 90,
+    score: 0, kills: 0, round: 1, enemiesLeft: 0, money: 800, weapon: "ak47" as PlayerState["weapon"] });
+  const [highKills, setHighKills] = useState(() => {
+    try { return parseInt(localStorage.getItem("fps_hk") || "0"); } catch { return 0; }
   });
 
-  const resetGame = useCallback(() => {
-    nextId = 1;
-    stateRef.current = { phase: "playing", wave: 1, waveTimer: 0, spawnQueue: 8, spawnTimer: 60, totalScore: 0 };
-    playerRef.current = {
-      x: W / 2 - 16, y: H / 2 - 16, w: 32, h: 32,
-      hp: 100, maxHp: 100, ammo: 30, maxAmmo: 30,
-      reloading: false, reloadTimer: 0, shootCooldown: 0, shield: 0, score: 0, kills: 0,
-    };
-    bulletsRef.current = [];
-    enemiesRef.current = [];
-    particlesRef.current = [];
-    setUi({ phase: "playing", wave: 1, score: 0 });
+  const spawnEnemies = useCallback((round: number) => {
+    const positions: [number, number][] = [
+      [17, 2], [15, 14], [3, 13], [11, 10], [17, 13], [13, 5], [6, 9], [4, 6]
+    ];
+    const count = Math.min(2 + round, 6);
+    const list: Enemy[] = [];
+    for (let i = 0; i < count; i++) {
+      const [x, y] = positions[(i + round) % positions.length];
+      list.push({
+        id: i + round * 100,
+        x: x + 0.5, y: y + 0.5,
+        hp: 100 + round * 10, maxHp: 100 + round * 10,
+        alive: true, shootTimer: 60 + Math.random() * 60,
+        state: "patrol", deathTimer: 0,
+      });
+    }
+    enemiesRef.current = list;
   }, []);
+
+  const resetGame = useCallback(() => {
+    playerRef.current = {
+      x: 2.5, y: 2.5, angle: 0,
+      hp: 100, armor: 100,
+      ammo: 30, maxAmmo: 30, reserve: 90,
+      reloading: false, reloadT: 0,
+      shootCd: 0, recoil: 0, bob: 0,
+      hitFlash: 0, muzzleFlash: 0,
+      weapon: "ak47",
+    };
+    stateRef.current = { phase: "playing", score: 0, kills: 0, round: 1, money: 800 };
+    bulletsRef.current = [];
+    spawnEnemies(1);
+    setUi(u => ({ ...u, phase: "playing", hp: 100, armor: 100, ammo: 30, reserve: 90,
+      score: 0, kills: 0, round: 1, money: 800, enemiesLeft: enemiesRef.current.length }));
+  }, [spawnEnemies]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -171,546 +179,670 @@ export default function Index() {
     const ctx = canvas.getContext("2d")!;
 
     const onKey = (e: KeyboardEvent, down: boolean) => {
-      keysRef.current[e.key.toLowerCase()] = down;
-      if (down && e.key.toLowerCase() === "r" && !playerRef.current.reloading && playerRef.current.ammo < playerRef.current.maxAmmo) {
+      const k = e.key.toLowerCase();
+      keysRef.current[k] = down;
+      if (down && k === "r" && !playerRef.current.reloading && playerRef.current.ammo < playerRef.current.maxAmmo && playerRef.current.reserve > 0) {
         playerRef.current.reloading = true;
-        playerRef.current.reloadTimer = 120;
+        playerRef.current.reloadT = 120;
       }
-      if (down && e.key === " ") {
-        const gs = stateRef.current;
-        if (gs.phase === "menu") { resetGame(); }
-        else if (gs.phase === "paused") { gs.phase = "playing"; setUi(u => ({ ...u, phase: "playing" })); }
-        else if (gs.phase === "playing") { gs.phase = "paused"; setUi(u => ({ ...u, phase: "paused" })); }
-        else if (gs.phase === "dead") { resetGame(); }
-        else if (gs.phase === "wave_clear") { startNextWave(); }
-        e.preventDefault();
+      if (down && (k === "1" || k === "2" || k === "3")) {
+        const w: PlayerState["weapon"] = k === "1" ? "ak47" : k === "2" ? "awp" : "glock";
+        const p = playerRef.current;
+        p.weapon = w;
+        if (w === "ak47") { p.maxAmmo = 30; p.ammo = Math.min(p.ammo, 30); }
+        if (w === "awp") { p.maxAmmo = 5; p.ammo = Math.min(p.ammo, 5); }
+        if (w === "glock") { p.maxAmmo = 20; p.ammo = Math.min(p.ammo, 20); }
+        setUi(u => ({ ...u, weapon: w, ammo: p.ammo, reserve: p.reserve }));
       }
     };
 
-    const startNextWave = () => {
-      const gs = stateRef.current;
-      gs.wave++;
-      gs.phase = "playing";
-      gs.spawnQueue = 6 + gs.wave * 3;
-      gs.spawnTimer = 90;
-      playerRef.current.ammo = playerRef.current.maxAmmo;
-      playerRef.current.reloading = false;
-      setUi(u => ({ ...u, phase: "playing", wave: gs.wave }));
+    const onMouseMove = (e: MouseEvent) => {
+      if (pointerLockedRef.current) mouseDxRef.current += e.movementX * 0.003;
     };
-
-    const getCanvasPos = (e: MouseEvent): Vec2 => {
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = W / rect.width;
-      const scaleY = H / rect.height;
-      return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
-    };
-
-    const onMouseMove = (e: MouseEvent) => { mouseRef.current = getCanvasPos(e); };
-    const onMouseDown = (e: MouseEvent) => {
+    const onMouseDown = () => {
+      if (!pointerLockedRef.current) {
+        canvas.requestPointerLock();
+        if (stateRef.current.phase === "menu" || stateRef.current.phase === "dead") {
+          resetGame();
+        }
+      }
       mouseDownRef.current = true;
-      if (stateRef.current.phase === "menu") { resetGame(); }
-      else if (stateRef.current.phase === "dead") { resetGame(); }
-      else if (stateRef.current.phase === "wave_clear") { startNextWave(); }
-      mouseRef.current = getCanvasPos(e);
     };
     const onMouseUp = () => { mouseDownRef.current = false; };
+    const onLockChange = () => {
+      pointerLockedRef.current = document.pointerLockElement === canvas;
+    };
 
     window.addEventListener("keydown", (e) => onKey(e, true));
     window.addEventListener("keyup", (e) => onKey(e, false));
-    canvas.addEventListener("mousemove", onMouseMove);
     canvas.addEventListener("mousedown", onMouseDown);
     window.addEventListener("mouseup", onMouseUp);
-
-    // ── Stars background ──
-    const stars = Array.from({ length: 120 }, () => ({
-      x: Math.random() * W, y: Math.random() * H,
-      r: Math.random() * 1.5 + 0.3,
-      b: Math.random(),
-    }));
-
-    // ── Grid lines ──
-    const drawGrid = () => {
-      ctx.strokeStyle = "rgba(50,100,160,0.15)";
-      ctx.lineWidth = 1;
-      for (let x = 0; x < W; x += 40) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
-      }
-      for (let y = 0; y < H; y += 40) {
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-      }
-    };
-
-    const drawBg = (tick: number) => {
-      ctx.fillStyle = "#060a12";
-      ctx.fillRect(0, 0, W, H);
-      drawGrid();
-      stars.forEach(s => {
-        const b = 0.3 + 0.7 * Math.abs(Math.sin(tick * 0.01 + s.b * 10));
-        ctx.fillStyle = `rgba(180,220,255,${b * 0.7})`;
-        ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
-      });
-    };
-
-    const drawPlayer = (p: Player, tick: number) => {
-      const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
-      const mx = mouseRef.current.x, my = mouseRef.current.y;
-      const angle = Math.atan2(my - cy, mx - cx);
-
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(angle + Math.PI / 2);
-
-      // glow
-      if (p.shield > 0) {
-        ctx.shadowColor = "#00aaff";
-        ctx.shadowBlur = 20;
-      } else {
-        ctx.shadowColor = "#ff6a1a";
-        ctx.shadowBlur = 12;
-      }
-
-      // body
-      ctx.fillStyle = p.shield > 0 ? "#1a8fff" : "#ff6a1a";
-      drawRoundRect(ctx, -10, -14, 20, 28, 4);
-      ctx.fill();
-
-      // cockpit
-      ctx.fillStyle = p.shield > 0 ? "#aaddff" : "#ffcc88";
-      ctx.beginPath(); ctx.ellipse(0, -6, 6, 9, 0, 0, Math.PI * 2); ctx.fill();
-
-      // engines
-      ctx.fillStyle = "#333";
-      ctx.fillRect(-12, 8, 8, 10);
-      ctx.fillRect(4, 8, 8, 10);
-      // engine glow
-      const thrust = (Math.sin(tick * 0.3) + 1) / 2;
-      ctx.fillStyle = `rgba(255,${100 + thrust * 100},20,${0.7 + thrust * 0.3})`;
-      ctx.fillRect(-11, 18, 6, 4 + thrust * 4);
-      ctx.fillRect(5, 18, 6, 4 + thrust * 4);
-
-      ctx.shadowBlur = 0;
-      ctx.restore();
-
-      // shield ring
-      if (p.shield > 0) {
-        ctx.strokeStyle = `rgba(0,170,255,${p.shield / 200})`;
-        ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(cx, cy, p.w, 0, Math.PI * 2); ctx.stroke();
-      }
-    };
-
-    const drawEnemy = (e: Enemy) => {
-      const cx = e.x + e.w / 2, cy = e.y + e.h / 2;
-      const px = playerRef.current.x + 16, py = playerRef.current.y + 16;
-      const angle = Math.atan2(py - cy, px - cx) + Math.PI / 2;
-
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(angle);
-      ctx.shadowColor = e.color;
-      ctx.shadowBlur = 10;
-
-      if (e.type === "boss") {
-        ctx.fillStyle = e.color;
-        ctx.beginPath();
-        for (let i = 0; i < 6; i++) {
-          const a = (i / 6) * Math.PI * 2;
-          const r = i % 2 === 0 ? e.w / 2 : e.w / 3.5;
-          if (i === 0) { ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r); } else { ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r); }
-        }
-        ctx.closePath(); ctx.fill();
-        ctx.fillStyle = "#ff8888";
-        ctx.beginPath(); ctx.arc(0, 0, e.w / 5, 0, Math.PI * 2); ctx.fill();
-      } else if (e.type === "tank") {
-        ctx.fillStyle = e.color;
-        ctx.fillRect(-e.w / 2, -e.h / 2, e.w, e.h);
-        ctx.fillStyle = "#ffaa44";
-        ctx.fillRect(-e.w / 4, -e.h / 2 - 8, e.w / 2, 10);
-      } else if (e.type === "fast") {
-        ctx.fillStyle = e.color;
-        ctx.beginPath();
-        ctx.moveTo(0, -e.h / 2);
-        ctx.lineTo(e.w / 2, e.h / 2);
-        ctx.lineTo(-e.w / 2, e.h / 2);
-        ctx.closePath(); ctx.fill();
-      } else {
-        ctx.fillStyle = e.color;
-        drawRoundRect(ctx, -e.w / 2, -e.h / 2, e.w, e.h, 4);
-        ctx.fill();
-        ctx.fillStyle = "#ff9999";
-        ctx.beginPath(); ctx.arc(0, 0, e.w / 5, 0, Math.PI * 2); ctx.fill();
-      }
-
-      ctx.shadowBlur = 0;
-      ctx.restore();
-
-      // HP bar
-      const bw = e.w + 8;
-      const bx = e.x + e.w / 2 - bw / 2;
-      const by = e.y - 10;
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.fillRect(bx, by, bw, 4);
-      const hpPct = e.hp / e.maxHp;
-      ctx.fillStyle = hpPct > 0.5 ? "#2ecc71" : hpPct > 0.25 ? "#f39c12" : "#e74c3c";
-      ctx.fillRect(bx, by, bw * hpPct, 4);
-    };
-
-    const drawBullet = (b: Bullet) => {
-      ctx.save();
-      if (b.friendly) {
-        ctx.shadowColor = "#00ccff";
-        ctx.shadowBlur = 8;
-        ctx.fillStyle = "#88eeff";
-      } else {
-        ctx.shadowColor = "#ff4444";
-        ctx.shadowBlur = 6;
-        ctx.fillStyle = "#ff8888";
-      }
-      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
-      ctx.shadowBlur = 0;
-      ctx.restore();
-    };
-
-    const drawHUD = (p: Player, gs: GameState, tick: number) => {
-      // HP bar
-      const hpPct = p.hp / p.maxHp;
-      ctx.fillStyle = "rgba(0,0,0,0.7)";
-      ctx.fillRect(12, H - 44, 160, 14);
-      ctx.fillStyle = hpPct > 0.5 ? "#2ecc71" : hpPct > 0.25 ? "#f39c12" : "#e74c3c";
-      ctx.fillRect(12, H - 44, 160 * hpPct, 14);
-      ctx.strokeStyle = "rgba(255,255,255,0.2)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(12, H - 44, 160, 14);
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 10px 'Oswald', monospace";
-      ctx.fillText(`HP  ${p.hp}/${p.maxHp}`, 16, H - 33);
-
-      // Ammo
-      const ammoPct = p.ammo / p.maxAmmo;
-      ctx.fillStyle = "rgba(0,0,0,0.7)";
-      ctx.fillRect(12, H - 24, 160, 10);
-      ctx.fillStyle = p.reloading ? `rgba(255,200,0,${0.5 + 0.5 * Math.sin(tick * 0.2)})` : "#4488ff";
-      ctx.fillRect(12, H - 24, 160 * (p.reloading ? 1 - p.reloadTimer / 120 : ammoPct), 10);
-      ctx.strokeStyle = "rgba(255,255,255,0.15)";
-      ctx.strokeRect(12, H - 24, 160, 10);
-      ctx.fillStyle = "#aaa";
-      ctx.font = "9px monospace";
-      ctx.fillText(p.reloading ? "ПЕРЕЗАРЯДКА..." : `${p.ammo}/${p.maxAmmo}`, 16, H - 16);
-
-      // Score & wave
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.fillRect(W - 160, 10, 148, 52);
-      ctx.fillStyle = "#ff6a1a";
-      ctx.font = "bold 22px 'Oswald', monospace";
-      ctx.textAlign = "right";
-      ctx.fillText(p.score.toLocaleString(), W - 14, 36);
-      ctx.fillStyle = "rgba(255,255,255,0.4)";
-      ctx.font = "11px monospace";
-      ctx.fillText(`СЧЁТ`, W - 14, 52);
-      ctx.fillStyle = "#aaa";
-      ctx.fillText(`ВОЛНА ${gs.wave}`, W - 14, 14);
-      ctx.textAlign = "left";
-
-      // kills
-      ctx.fillStyle = "rgba(255,255,255,0.5)";
-      ctx.font = "11px monospace";
-      ctx.fillText(`☠ ${p.kills}`, 12, H - 54);
-
-      // crosshair
-      const mx = mouseRef.current.x, my = mouseRef.current.y;
-      ctx.strokeStyle = "rgba(0,220,255,0.8)";
-      ctx.lineWidth = 1.5;
-      const cs = 10;
-      ctx.beginPath(); ctx.moveTo(mx - cs, my); ctx.lineTo(mx + cs, my); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(mx, my - cs); ctx.lineTo(mx, my + cs); ctx.stroke();
-      ctx.beginPath(); ctx.arc(mx, my, 5, 0, Math.PI * 2); ctx.stroke();
-    };
-
-    const drawMenu = (tick: number) => {
-      ctx.fillStyle = "rgba(0,0,0,0.7)";
-      ctx.fillRect(0, 0, W, H);
-
-      // Title
-      ctx.save();
-      ctx.shadowColor = "#ff6a1a";
-      ctx.shadowBlur = 30 + 10 * Math.sin(tick * 0.05);
-      ctx.fillStyle = "#ff6a1a";
-      ctx.font = "bold 64px 'Oswald', monospace";
-      ctx.textAlign = "center";
-      ctx.fillText("FORGE", W / 2, H / 2 - 60);
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "bold 32px 'Oswald', monospace";
-      ctx.fillText("OF LEGENDS", W / 2, H / 2 - 20);
-      ctx.shadowBlur = 0;
-      ctx.restore();
-
-      ctx.fillStyle = "#888";
-      ctx.font = "14px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText("топ-вид шутер · волновой режим", W / 2, H / 2 + 20);
-
-      const pulse = 0.7 + 0.3 * Math.sin(tick * 0.08);
-      ctx.fillStyle = `rgba(255,200,50,${pulse})`;
-      ctx.font = "bold 18px monospace";
-      ctx.fillText("НАЖМИ ДЛЯ СТАРТА", W / 2, H / 2 + 70);
-
-      ctx.fillStyle = "#444";
-      ctx.font = "12px monospace";
-      ctx.fillText("WASD / стрелки — движение   ЛКМ — огонь   R — перезарядка", W / 2, H / 2 + 100);
-
-      if (highScore > 0) {
-        ctx.fillStyle = "#c8963e";
-        ctx.font = "13px monospace";
-        ctx.fillText(`РЕКОРД: ${highScore.toLocaleString()}`, W / 2, H / 2 + 124);
-      }
-      ctx.textAlign = "left";
-    };
-
-    const drawDead = (p: Player, tick: number) => {
-      ctx.fillStyle = "rgba(0,0,0,0.8)";
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = "#e74c3c";
-      ctx.font = "bold 56px 'Oswald', monospace";
-      ctx.textAlign = "center";
-      ctx.shadowColor = "#e74c3c";
-      ctx.shadowBlur = 20;
-      ctx.fillText("GAME OVER", W / 2, H / 2 - 50);
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = "#ccc";
-      ctx.font = "20px 'Oswald', monospace";
-      ctx.fillText(`СЧЁТ: ${p.score.toLocaleString()}`, W / 2, H / 2);
-      ctx.font = "15px monospace";
-      ctx.fillText(`Убито врагов: ${p.kills}`, W / 2, H / 2 + 28);
-      const pulse = 0.7 + 0.3 * Math.sin(tick * 0.08);
-      ctx.fillStyle = `rgba(255,200,50,${pulse})`;
-      ctx.font = "bold 16px monospace";
-      ctx.fillText("НАЖМИ ДЛЯ РЕСТАРТА", W / 2, H / 2 + 70);
-      ctx.textAlign = "left";
-    };
-
-    const drawWaveClear = (gs: GameState, tick: number) => {
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = "#c8963e";
-      ctx.font = "bold 48px 'Oswald', monospace";
-      ctx.textAlign = "center";
-      ctx.shadowColor = "#c8963e";
-      ctx.shadowBlur = 20;
-      ctx.fillText(`ВОЛНА ${gs.wave} ПРОЙДЕНА!`, W / 2, H / 2 - 30);
-      ctx.shadowBlur = 0;
-      const pulse = 0.7 + 0.3 * Math.sin(tick * 0.1);
-      ctx.fillStyle = `rgba(255,255,255,${pulse})`;
-      ctx.font = "bold 16px monospace";
-      ctx.fillText("НАЖМИ ДЛЯ СЛЕДУЮЩЕЙ ВОЛНЫ", W / 2, H / 2 + 20);
-      ctx.textAlign = "left";
-    };
-
-    const drawPaused = () => {
-      ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 48px 'Oswald', monospace";
-      ctx.textAlign = "center";
-      ctx.fillText("ПАУЗА", W / 2, H / 2);
-      ctx.fillStyle = "#888";
-      ctx.font = "14px monospace";
-      ctx.fillText("ПРОБЕЛ — продолжить", W / 2, H / 2 + 36);
-      ctx.textAlign = "left";
-    };
+    window.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("pointerlockchange", onLockChange);
 
     let tick = 0;
+
+    const drawSky = () => {
+      const sky = ctx.createLinearGradient(0, 0, 0, H / 2);
+      sky.addColorStop(0, "#1a1f2a");
+      sky.addColorStop(1, "#3a3528");
+      ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H / 2);
+      const floor = ctx.createLinearGradient(0, H / 2, 0, H);
+      floor.addColorStop(0, "#2a2520");
+      floor.addColorStop(1, "#0a0a08");
+      ctx.fillStyle = floor; ctx.fillRect(0, H / 2, W, H / 2);
+    };
+
+    const render3D = (p: PlayerState) => {
+      const colW = W / NUM_RAYS;
+      const verticalShift = p.recoil * 6;
+
+      for (let i = 0; i < NUM_RAYS; i++) {
+        const rayAngle = p.angle - FOV / 2 + (i / NUM_RAYS) * FOV;
+        const ray = castRay(p.x, p.y, rayAngle);
+        const correctDist = ray.dist * Math.cos(rayAngle - p.angle);
+        zBufferRef.current[i] = correctDist;
+        const wallH = Math.min(H * 1.2, (H / correctDist) * 0.85);
+        const wallTop = (H - wallH) / 2 + verticalShift;
+
+        // wall slice
+        const dark = correctDist > 6;
+        ctx.fillStyle = wallColor(ray.wallType, ray.side, dark);
+        ctx.fillRect(i * colW, wallTop, colW + 1, wallH);
+
+        // vertical seam for crate
+        if (ray.wallType === 2) {
+          if (ray.hitX < 0.05 || ray.hitX > 0.95 || Math.abs(ray.hitX - 0.5) < 0.02) {
+            ctx.fillStyle = "rgba(0,0,0,0.4)";
+            ctx.fillRect(i * colW, wallTop, colW + 1, wallH);
+          }
+        }
+        if (ray.wallType === 3) {
+          // metal panel strip
+          if (Math.abs(ray.hitX - 0.33) < 0.015 || Math.abs(ray.hitX - 0.66) < 0.015) {
+            ctx.fillStyle = "rgba(0,0,0,0.5)";
+            ctx.fillRect(i * colW, wallTop, colW + 1, wallH);
+          }
+        }
+
+        // fog
+        const fog = Math.min(0.7, correctDist / 14);
+        ctx.fillStyle = `rgba(10,15,20,${fog})`;
+        ctx.fillRect(i * colW, wallTop, colW + 1, wallH);
+      }
+    };
+
+    const drawSprites = (p: PlayerState) => {
+      // Sort enemies by distance (farther first)
+      const sorted = [...enemiesRef.current].map(e => ({
+        ...e, dist: (p.x - e.x) ** 2 + (p.y - e.y) ** 2
+      })).sort((a, b) => b.dist - a.dist);
+
+      for (const e of sorted) {
+        const dx = e.x - p.x, dy = e.y - p.y;
+        const invDet = 1.0 / (Math.cos(p.angle + Math.PI / 2) * Math.sin(p.angle) - Math.sin(p.angle + Math.PI / 2) * Math.cos(p.angle));
+        const transformX = invDet * (Math.sin(p.angle) * dx - Math.cos(p.angle) * dy);
+        const transformY = invDet * (-Math.cos(p.angle + Math.PI / 2) * dx + Math.sin(p.angle + Math.PI / 2) * dy);
+        if (transformY <= 0.1) continue;
+        const screenX = (W / 2) * (1 + transformX / transformY);
+        const spriteSize = Math.abs(H / transformY) * 0.8;
+        const drawStartY = H / 2 - spriteSize / 2 + p.recoil * 6;
+        const drawStartX = screenX - spriteSize / 2;
+
+        if (!e.alive) {
+          // Lying dead body
+          const bodyH = spriteSize * 0.3;
+          ctx.fillStyle = `rgba(80,20,20,${Math.max(0, 1 - e.deathTimer / 300)})`;
+          ctx.fillRect(drawStartX + spriteSize * 0.1, H / 2 + spriteSize * 0.1, spriteSize * 0.8, bodyH);
+          continue;
+        }
+
+        // Depth test: check center column
+        const centerRay = Math.floor((screenX / W) * NUM_RAYS);
+        if (centerRay >= 0 && centerRay < NUM_RAYS && transformY > zBufferRef.current[centerRay]) continue;
+
+        // Body
+        ctx.save();
+        const headY = drawStartY + spriteSize * 0.05;
+        const bodyY = drawStartY + spriteSize * 0.28;
+        const legY = drawStartY + spriteSize * 0.6;
+        const ew = spriteSize * 0.45;
+
+        // shadow
+        ctx.fillStyle = "rgba(0,0,0,0.4)";
+        ctx.beginPath();
+        ctx.ellipse(screenX, drawStartY + spriteSize * 0.98, ew * 0.6, spriteSize * 0.06, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // legs (dark pants)
+        ctx.fillStyle = "#2a2a2a";
+        ctx.fillRect(screenX - ew / 3, legY, ew * 0.3, spriteSize * 0.35);
+        ctx.fillRect(screenX + ew / 30, legY, ew * 0.3, spriteSize * 0.35);
+
+        // torso (tactical vest)
+        ctx.fillStyle = "#1a1f2a";
+        ctx.fillRect(screenX - ew / 2, bodyY, ew, spriteSize * 0.35);
+        ctx.fillStyle = "#3a3f4a";
+        ctx.fillRect(screenX - ew / 2 + 2, bodyY + 4, ew - 4, spriteSize * 0.1);
+
+        // head
+        ctx.fillStyle = "#c9a58a";
+        ctx.beginPath();
+        ctx.ellipse(screenX, headY + spriteSize * 0.08, ew * 0.35, spriteSize * 0.12, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // balaclava
+        ctx.fillStyle = "#0a0a0a";
+        ctx.fillRect(screenX - ew * 0.35, headY + spriteSize * 0.02, ew * 0.7, spriteSize * 0.1);
+
+        // eyes glint
+        ctx.fillStyle = "#ff3030";
+        ctx.fillRect(screenX - ew * 0.15, headY + spriteSize * 0.075, 2, 2);
+        ctx.fillRect(screenX + ew * 0.1, headY + spriteSize * 0.075, 2, 2);
+
+        // weapon
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(screenX - ew * 0.05, bodyY + spriteSize * 0.12, ew * 0.7, spriteSize * 0.06);
+
+        // HP bar
+        const hpPct = e.hp / e.maxHp;
+        const barW = spriteSize * 0.6;
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(screenX - barW / 2, drawStartY - 8, barW, 4);
+        ctx.fillStyle = hpPct > 0.5 ? "#2ecc71" : hpPct > 0.25 ? "#f39c12" : "#e74c3c";
+        ctx.fillRect(screenX - barW / 2, drawStartY - 8, barW * hpPct, 4);
+
+        ctx.restore();
+      }
+    };
+
+    const drawWeapon = (p: PlayerState) => {
+      const bob = Math.sin(tick * 0.15) * p.bob * 4;
+      const offsetY = p.recoil * 12;
+      const weapon = p.weapon;
+
+      if (weapon === "ak47") {
+        const wx = W * 0.55, wy = H - 220 + bob + offsetY;
+        // stock
+        ctx.fillStyle = "#3a2418";
+        ctx.fillRect(wx, wy, 140, 70);
+        ctx.fillStyle = "#5a3828";
+        ctx.fillRect(wx + 4, wy + 4, 132, 15);
+        // body
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(wx + 120, wy - 30, 200, 100);
+        // magazine
+        ctx.fillStyle = "#2a2520";
+        ctx.beginPath();
+        ctx.moveTo(wx + 170, wy + 70);
+        ctx.lineTo(wx + 190, wy + 130);
+        ctx.lineTo(wx + 240, wy + 130);
+        ctx.lineTo(wx + 220, wy + 70);
+        ctx.closePath(); ctx.fill();
+        // barrel
+        ctx.fillStyle = "#0a0a0a";
+        ctx.fillRect(wx + 320, wy - 10, 180, 20);
+        // sight
+        ctx.fillStyle = "#2a2a2a";
+        ctx.fillRect(wx + 220, wy - 50, 30, 20);
+        ctx.fillStyle = "#ff6a1a";
+        ctx.fillRect(wx + 230, wy - 42, 10, 4);
+
+        if (p.muzzleFlash > 0) {
+          ctx.save();
+          ctx.globalAlpha = p.muzzleFlash;
+          const mx = wx + 500, my = wy;
+          const grad = ctx.createRadialGradient(mx, my, 2, mx, my, 60);
+          grad.addColorStop(0, "#ffffff");
+          grad.addColorStop(0.3, "#ffcc00");
+          grad.addColorStop(1, "rgba(255,100,0,0)");
+          ctx.fillStyle = grad;
+          ctx.beginPath(); ctx.arc(mx, my, 60, 0, Math.PI * 2); ctx.fill();
+          ctx.restore();
+        }
+      } else if (weapon === "awp") {
+        const wx = W * 0.5, wy = H - 200 + bob + offsetY;
+        // stock
+        ctx.fillStyle = "#0f3a28";
+        ctx.fillRect(wx, wy + 10, 180, 60);
+        // body
+        ctx.fillStyle = "#0a2a1a";
+        ctx.fillRect(wx + 160, wy, 180, 60);
+        // long barrel
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(wx + 340, wy + 15, 260, 16);
+        // scope
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(wx + 200, wy - 60, 140, 50);
+        ctx.fillStyle = "#000";
+        ctx.beginPath(); ctx.arc(wx + 270, wy - 35, 22, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#4a8aff";
+        ctx.beginPath(); ctx.arc(wx + 270, wy - 35, 18, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#000";
+        ctx.fillRect(wx + 248, wy - 36, 44, 2);
+        ctx.fillRect(wx + 269, wy - 55, 2, 42);
+
+        if (p.muzzleFlash > 0) {
+          ctx.save();
+          ctx.globalAlpha = p.muzzleFlash;
+          const mx = wx + 600, my = wy + 23;
+          const grad = ctx.createRadialGradient(mx, my, 2, mx, my, 80);
+          grad.addColorStop(0, "#ffffff");
+          grad.addColorStop(0.3, "#ffcc00");
+          grad.addColorStop(1, "rgba(255,100,0,0)");
+          ctx.fillStyle = grad;
+          ctx.beginPath(); ctx.arc(mx, my, 80, 0, Math.PI * 2); ctx.fill();
+          ctx.restore();
+        }
+      } else {
+        // Glock
+        const wx = W * 0.6, wy = H - 180 + bob + offsetY;
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(wx, wy, 120, 60);
+        ctx.fillRect(wx + 90, wy, 80, 18);
+        ctx.fillStyle = "#2a2a2a";
+        ctx.fillRect(wx + 20, wy + 60, 50, 70);
+        ctx.fillStyle = "#3a3a3a";
+        ctx.fillRect(wx + 2, wy + 2, 116, 8);
+
+        if (p.muzzleFlash > 0) {
+          ctx.save();
+          ctx.globalAlpha = p.muzzleFlash;
+          const mx = wx + 170, my = wy + 9;
+          const grad = ctx.createRadialGradient(mx, my, 2, mx, my, 40);
+          grad.addColorStop(0, "#ffffff");
+          grad.addColorStop(0.3, "#ffcc00");
+          grad.addColorStop(1, "rgba(255,100,0,0)");
+          ctx.fillStyle = grad;
+          ctx.beginPath(); ctx.arc(mx, my, 40, 0, Math.PI * 2); ctx.fill();
+          ctx.restore();
+        }
+      }
+    };
+
+    const drawCrosshair = (p: PlayerState) => {
+      const cx = W / 2, cy = H / 2;
+      const spread = 4 + p.recoil * 20 + (mouseDownRef.current ? 3 : 0);
+      ctx.strokeStyle = "rgba(0,255,120,0.9)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - spread - 6, cy); ctx.lineTo(cx - spread, cy);
+      ctx.moveTo(cx + spread, cy); ctx.lineTo(cx + spread + 6, cy);
+      ctx.moveTo(cx, cy - spread - 6); ctx.lineTo(cx, cy - spread);
+      ctx.moveTo(cx, cy + spread); ctx.lineTo(cx, cy + spread + 6);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(0,255,120,0.9)";
+      ctx.fillRect(cx - 1, cy - 1, 2, 2);
+    };
+
+    const drawHUD = (p: PlayerState, gs: GameState) => {
+      // Bottom gradient bar
+      const grad = ctx.createLinearGradient(0, H - 90, 0, H);
+      grad.addColorStop(0, "rgba(0,0,0,0)");
+      grad.addColorStop(1, "rgba(0,0,0,0.85)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, H - 90, W, 90);
+
+      // HP
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 26px 'Oswald', monospace";
+      ctx.textAlign = "left";
+      const hpColor = p.hp > 50 ? "#fff" : p.hp > 25 ? "#f39c12" : "#e74c3c";
+      ctx.fillStyle = hpColor;
+      ctx.fillText(`+ ${p.hp}`, 30, H - 25);
+      ctx.fillStyle = "#888";
+      ctx.font = "10px monospace";
+      ctx.fillText("HEALTH", 30, H - 52);
+
+      // Armor
+      ctx.fillStyle = "#4aaaff";
+      ctx.font = "bold 26px 'Oswald', monospace";
+      ctx.fillText(`◈ ${p.armor}`, 140, H - 25);
+      ctx.fillStyle = "#888";
+      ctx.font = "10px monospace";
+      ctx.fillText("ARMOR", 140, H - 52);
+
+      // Money
+      ctx.fillStyle = "#a4d65e";
+      ctx.font = "bold 22px 'Oswald', monospace";
+      ctx.fillText(`$ ${gs.money}`, 260, H - 28);
+      ctx.fillStyle = "#888";
+      ctx.font = "10px monospace";
+      ctx.fillText("CASH", 260, H - 52);
+
+      // Ammo right
+      ctx.textAlign = "right";
+      ctx.fillStyle = p.reloading ? "#f39c12" : "#fff";
+      ctx.font = "bold 34px 'Oswald', monospace";
+      const ammoTxt = p.reloading ? "..." : `${p.ammo}`;
+      ctx.fillText(ammoTxt, W - 140, H - 20);
+      ctx.fillStyle = "#888";
+      ctx.font = "bold 18px 'Oswald', monospace";
+      ctx.fillText(`/ ${p.reserve}`, W - 30, H - 25);
+      ctx.font = "10px monospace";
+      ctx.fillText(p.weapon.toUpperCase(), W - 30, H - 52);
+
+      // Top: round + kills
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(W / 2 - 90, 10, 180, 36);
+      ctx.strokeStyle = "rgba(255,106,26,0.3)";
+      ctx.strokeRect(W / 2 - 90, 10, 180, 36);
+      ctx.fillStyle = "#ff6a1a";
+      ctx.font = "bold 14px 'Oswald', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`ROUND ${gs.round}`, W / 2, 27);
+      ctx.fillStyle = "#fff";
+      ctx.font = "11px monospace";
+      const alive = enemiesRef.current.filter(e => e.alive).length;
+      ctx.fillText(`☠ ${gs.kills}   ·   ENEMIES: ${alive}`, W / 2, 42);
+
+      // Hit flash
+      if (p.hitFlash > 0) {
+        ctx.fillStyle = `rgba(200,0,0,${p.hitFlash * 0.35})`;
+        ctx.fillRect(0, 0, W, H);
+      }
+
+      // Reload bar
+      if (p.reloading) {
+        const pct = 1 - p.reloadT / 120;
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(W / 2 - 80, H / 2 + 50, 160, 8);
+        ctx.fillStyle = "#f39c12";
+        ctx.fillRect(W / 2 - 80, H / 2 + 50, 160 * pct, 8);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 11px 'Oswald', monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("ПЕРЕЗАРЯДКА", W / 2, H / 2 + 45);
+      }
+
+      // Minimap
+      const mmSize = 120, mmX = W - mmSize - 14, mmY = 14;
+      const cell = mmSize / MW;
+      ctx.fillStyle = "rgba(0,0,0,0.8)";
+      ctx.fillRect(mmX, mmY, mmSize, (mmSize * MH / MW));
+      for (let y = 0; y < MH; y++) {
+        for (let x = 0; x < MW; x++) {
+          if (MAP[y][x] > 0) {
+            ctx.fillStyle = MAP[y][x] === 2 ? "rgba(150,100,50,0.9)" :
+                             MAP[y][x] === 3 ? "rgba(90,110,130,0.9)" : "rgba(120,110,95,0.9)";
+            ctx.fillRect(mmX + x * cell, mmY + y * cell, cell, cell);
+          }
+        }
+      }
+      // enemies on map
+      enemiesRef.current.filter(e => e.alive).forEach(e => {
+        ctx.fillStyle = "#ff3030";
+        ctx.fillRect(mmX + e.x * cell - 2, mmY + e.y * cell - 2, 4, 4);
+      });
+      // player
+      ctx.fillStyle = "#00ff88";
+      ctx.beginPath();
+      ctx.arc(mmX + p.x * cell, mmY + p.y * cell, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#00ff88";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(mmX + p.x * cell, mmY + p.y * cell);
+      ctx.lineTo(mmX + (p.x + Math.cos(p.angle) * 1.5) * cell, mmY + (p.y + Math.sin(p.angle) * 1.5) * cell);
+      ctx.stroke();
+
+      // vignette
+      const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.4, W / 2, H / 2, H * 0.75);
+      vig.addColorStop(0, "rgba(0,0,0,0)");
+      vig.addColorStop(1, "rgba(0,0,0,0.55)");
+      ctx.fillStyle = vig;
+      ctx.fillRect(0, 0, W, H);
+    };
+
+    const drawMenu = () => {
+      ctx.fillStyle = "#050810";
+      ctx.fillRect(0, 0, W, H);
+      // scan lines
+      for (let y = 0; y < H; y += 3) {
+        ctx.fillStyle = "rgba(255,255,255,0.015)";
+        ctx.fillRect(0, y, W, 1);
+      }
+      ctx.save();
+      ctx.shadowColor = "#ff6a1a";
+      ctx.shadowBlur = 30;
+      ctx.fillStyle = "#ff6a1a";
+      ctx.font = "bold 72px 'Oswald', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("OPERATION", W / 2, H / 2 - 80);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 54px 'Oswald', monospace";
+      ctx.fillText("BLACK SITE", W / 2, H / 2 - 25);
+      ctx.restore();
+
+      ctx.fillStyle = "#aaa";
+      ctx.font = "14px monospace";
+      ctx.fillText("FPS · 1v6 BOT MATCH · TACTICAL COMBAT", W / 2, H / 2 + 10);
+
+      const pulse = 0.6 + 0.4 * Math.sin(tick * 0.08);
+      ctx.fillStyle = `rgba(255,200,50,${pulse})`;
+      ctx.font = "bold 20px 'Oswald', monospace";
+      ctx.fillText("НАЖМИ, ЧТОБЫ ВОЙТИ", W / 2, H / 2 + 70);
+
+      ctx.fillStyle = "#555";
+      ctx.font = "11px monospace";
+      ctx.fillText("WASD — движение   МЫШЬ — осмотр   ЛКМ — огонь   R — перезарядка", W / 2, H / 2 + 110);
+      ctx.fillText("1 — AK-47    2 — AWP    3 — Glock    ESC — выйти", W / 2, H / 2 + 128);
+
+      if (highKills > 0) {
+        ctx.fillStyle = "#c8963e";
+        ctx.font = "12px monospace";
+        ctx.fillText(`РЕКОРД: ${highKills} убийств`, W / 2, H / 2 + 155);
+      }
+      ctx.textAlign = "left";
+    };
+
+    const drawDead = (gs: GameState) => {
+      ctx.fillStyle = "rgba(80,0,0,0.55)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, H / 2 - 80, W, 160);
+      ctx.strokeStyle = "#ff3030";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, H / 2 - 80, W, 160);
+      ctx.fillStyle = "#ff3030";
+      ctx.font = "bold 54px 'Oswald', monospace";
+      ctx.textAlign = "center";
+      ctx.shadowColor = "#ff3030";
+      ctx.shadowBlur = 20;
+      ctx.fillText("YOU DIED", W / 2, H / 2);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#fff";
+      ctx.font = "16px 'Oswald', monospace";
+      ctx.fillText(`УБИЙСТВ: ${gs.kills}   ·   РАУНДОВ: ${gs.round}`, W / 2, H / 2 + 40);
+      const pulse = 0.6 + 0.4 * Math.sin(tick * 0.08);
+      ctx.fillStyle = `rgba(255,200,50,${pulse})`;
+      ctx.font = "bold 14px monospace";
+      ctx.fillText("ЛКМ — играть снова", W / 2, H / 2 + 68);
+      ctx.textAlign = "left";
+    };
+
+    const tryMove = (p: PlayerState, nx: number, ny: number) => {
+      const pad = 0.25;
+      if (mapAt(nx + pad, p.y) === 0 && mapAt(nx - pad, p.y) === 0) p.x = nx;
+      if (mapAt(p.x, ny + pad) === 0 && mapAt(p.x, ny - pad) === 0) p.y = ny;
+    };
+
+    const doShoot = (p: PlayerState) => {
+      const cost = p.weapon === "awp" ? 40 : p.weapon === "ak47" ? 8 : 6;
+      const dmg = p.weapon === "awp" ? 115 : p.weapon === "ak47" ? 36 : 18;
+      const cd = p.weapon === "awp" ? 45 : p.weapon === "ak47" ? 8 : 14;
+      const spread = p.weapon === "awp" ? 0.005 : p.weapon === "ak47" ? 0.015 + p.recoil * 0.03 : 0.025;
+
+      if (p.reloading || p.ammo <= 0 || p.shootCd > 0) return;
+      p.ammo--;
+      p.shootCd = cd;
+      p.recoil = Math.min(1, p.recoil + (p.weapon === "awp" ? 0.7 : 0.25));
+      p.muzzleFlash = 1;
+
+      const angle = p.angle + (Math.random() - 0.5) * spread * 2;
+      const ray = castRay(p.x, p.y, angle);
+
+      // Check enemies along ray
+      let hitEnemy: Enemy | null = null;
+      let hitDist = ray.dist;
+      for (const e of enemiesRef.current) {
+        if (!e.alive) continue;
+        const dx = e.x - p.x, dy = e.y - p.y;
+        const proj = dx * Math.cos(angle) + dy * Math.sin(angle);
+        if (proj < 0.2 || proj > hitDist) continue;
+        const perp = Math.abs(-dx * Math.sin(angle) + dy * Math.cos(angle));
+        if (perp < 0.35) {
+          hitEnemy = e;
+          hitDist = proj;
+        }
+      }
+
+      if (hitEnemy) {
+        const headshot = Math.random() < 0.25;
+        const finalDmg = headshot ? dmg * 2 : dmg;
+        hitEnemy.hp -= finalDmg;
+        stateRef.current.score += headshot ? 150 : 100;
+        if (hitEnemy.hp <= 0 && hitEnemy.alive) {
+          hitEnemy.alive = false;
+          hitEnemy.deathTimer = 0;
+          stateRef.current.kills++;
+          stateRef.current.money += 300;
+          setUi(u => ({ ...u, kills: stateRef.current.kills, money: stateRef.current.money,
+            enemiesLeft: enemiesRef.current.filter(e => e.alive).length }));
+        }
+      }
+
+      setUi(u => ({ ...u, ammo: p.ammo, reserve: p.reserve }));
+
+      if (p.ammo === 0 && p.reserve > 0 && !p.reloading) {
+        p.reloading = true; p.reloadT = 120;
+      }
+    };
 
     const loop = () => {
       tick++;
       frameRef.current = requestAnimationFrame(loop);
-      const gs = stateRef.current;
       const p = playerRef.current;
+      const gs = stateRef.current;
 
-      drawBg(tick);
+      if (gs.phase === "menu") { drawMenu(); return; }
 
-      if (gs.phase === "menu") {
-        drawMenu(tick);
-        return;
-      }
-      if (gs.phase === "dead") {
-        drawDead(p, tick);
-        return;
-      }
-      if (gs.phase === "wave_clear") {
-        particlesRef.current.forEach(pt => {
-          ctx.globalAlpha = pt.life / pt.maxLife;
-          ctx.fillStyle = pt.color;
-          ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2); ctx.fill();
-        });
-        ctx.globalAlpha = 1;
-        drawWaveClear(gs, tick);
-        return;
-      }
-      if (gs.phase === "paused") {
-        // draw world frozen
-        enemiesRef.current.forEach(drawEnemy);
-        bulletsRef.current.forEach(drawBullet);
-        drawPlayer(p, tick);
-        drawHUD(p, gs, tick);
-        drawPaused();
-        return;
-      }
+      // ── Update ──
+      if (gs.phase === "playing") {
+        // mouse look
+        p.angle += mouseDxRef.current;
+        mouseDxRef.current = 0;
 
-      // ── Update phase: playing ──
-      // Player movement
-      const keys = keysRef.current;
-      let dx = 0, dy = 0;
-      if (keys["arrowleft"] || keys["a"]) dx -= PLAYER_SPEED;
-      if (keys["arrowright"] || keys["d"]) dx += PLAYER_SPEED;
-      if (keys["arrowup"] || keys["w"]) dy -= PLAYER_SPEED;
-      if (keys["arrowdown"] || keys["s"]) dy += PLAYER_SPEED;
-      if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
-      p.x = Math.max(0, Math.min(W - p.w, p.x + dx));
-      p.y = Math.max(0, Math.min(H - p.h, p.y + dy));
+        // keyboard look
+        if (keysRef.current["arrowleft"]) p.angle -= PLAYER_TURN;
+        if (keysRef.current["arrowright"]) p.angle += PLAYER_TURN;
 
-      // Reload
-      if (p.reloading) {
-        p.reloadTimer--;
-        if (p.reloadTimer <= 0) { p.reloading = false; p.ammo = p.maxAmmo; }
-      }
-      if (p.shield > 0) p.shield--;
+        // movement
+        let mvX = 0, mvY = 0;
+        const fwd = (keysRef.current["w"] || keysRef.current["arrowup"]) ? 1 : (keysRef.current["s"] || keysRef.current["arrowdown"]) ? -1 : 0;
+        const str = keysRef.current["d"] ? 1 : keysRef.current["a"] ? -1 : 0;
+        mvX = Math.cos(p.angle) * fwd * PLAYER_SPEED + Math.cos(p.angle + Math.PI / 2) * str * PLAYER_SPEED;
+        mvY = Math.sin(p.angle) * fwd * PLAYER_SPEED + Math.sin(p.angle + Math.PI / 2) * str * PLAYER_SPEED;
+        tryMove(p, p.x + mvX, p.y + mvY);
+        p.bob = (fwd !== 0 || str !== 0) ? Math.min(1, p.bob + 0.1) : Math.max(0, p.bob - 0.1);
 
-      // Shoot
-      if (p.shootCooldown > 0) p.shootCooldown--;
-      if (mouseDownRef.current && !p.reloading && p.ammo > 0 && p.shootCooldown <= 0) {
-        const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
-        const mx = mouseRef.current.x, my = mouseRef.current.y;
-        const len = Math.hypot(mx - cx, my - cy) || 1;
-        const vx = (mx - cx) / len * BULLET_SPEED;
-        const vy = (my - cy) / len * BULLET_SPEED;
-        bulletsRef.current.push({ id: uid(), x: cx, y: cy, vx, vy, friendly: true, dmg: 25, r: 4 });
-        p.ammo--;
-        p.shootCooldown = 8;
-        if (p.ammo === 0 && !p.reloading) { p.reloading = true; p.reloadTimer = 120; }
-      }
+        // timers
+        if (p.shootCd > 0) p.shootCd--;
+        p.recoil *= 0.88;
+        p.muzzleFlash *= 0.7;
+        p.hitFlash = Math.max(0, p.hitFlash - 0.04);
 
-      // Spawn enemies
-      if (gs.spawnQueue > 0) {
-        gs.spawnTimer--;
-        if (gs.spawnTimer <= 0) {
-          enemiesRef.current.push(spawnEnemy(gs.wave));
-          gs.spawnQueue--;
-          gs.spawnTimer = Math.max(20, 60 - gs.wave * 3);
-        }
-      }
-
-      // Check wave clear
-      if (gs.spawnQueue === 0 && enemiesRef.current.length === 0) {
-        gs.phase = "wave_clear";
-        setUi(u => ({ ...u, phase: "wave_clear", wave: gs.wave }));
-        return;
-      }
-
-      // Update enemies
-      const pcx = p.x + p.w / 2, pcy = p.y + p.h / 2;
-      enemiesRef.current = enemiesRef.current.filter(e => {
-        const ecx = e.x + e.w / 2, ecy = e.y + e.h / 2;
-        const dist = Math.hypot(pcx - ecx, pcy - ecy);
-        const len = dist || 1;
-
-        // Move toward player (with slight jitter for fast)
-        let jx = 0, jy = 0;
-        if (e.type === "fast") { jx = (Math.random() - 0.5) * 2; jy = (Math.random() - 0.5) * 2; }
-        e.vx += ((pcx - ecx) / len * e.speed - e.vx) * 0.1 + jx * 0.1;
-        e.vy += ((pcy - ecy) / len * e.speed - e.vy) * 0.1 + jy * 0.1;
-        e.x += e.vx; e.y += e.vy;
-
-        // Enemy shoot
-        e.shootTimer++;
-        if (e.shootTimer >= e.shootRate && e.type !== "fast") {
-          e.shootTimer = 0;
-          const vx = (pcx - ecx) / len * 4;
-          const vy = (pcy - ecy) / len * 4;
-          const count = e.type === "boss" ? 5 : 1;
-          for (let i = 0; i < count; i++) {
-            const spread = e.type === "boss" ? (i - 2) * 0.15 : 0;
-            bulletsRef.current.push({
-              id: uid(), x: ecx, y: ecy,
-              vx: vx + Math.sin(spread) * 2,
-              vy: vy + Math.cos(spread) * 2,
-              friendly: false, dmg: e.type === "boss" ? 15 : 8, r: 3,
-            });
+        // reload
+        if (p.reloading) {
+          p.reloadT--;
+          if (p.reloadT <= 0) {
+            const needed = p.maxAmmo - p.ammo;
+            const give = Math.min(needed, p.reserve);
+            p.ammo += give;
+            p.reserve -= give;
+            p.reloading = false;
+            setUi(u => ({ ...u, ammo: p.ammo, reserve: p.reserve }));
           }
         }
 
-        // Collision with player
-        if (rect(e.x, e.y, e.w, e.h, p.x, p.y, p.w, p.h)) {
-          const dmg = e.type === "boss" ? 30 : e.type === "tank" ? 20 : 10;
-          if (p.shield > 0) { p.shield = Math.max(0, p.shield - dmg); }
-          else { p.hp -= dmg; }
-          particlesRef.current.push(...makeParticles(pcx, pcy, "#ff6a1a", 6));
-          return false;
-        }
-        return true;
-      });
+        // shoot
+        if (mouseDownRef.current && p.weapon === "ak47") doShoot(p);
+        if (mouseDownRef.current && p.weapon !== "ak47" && p.shootCd <= 0) doShoot(p);
 
-      // Update bullets
-      bulletsRef.current = bulletsRef.current.filter(b => {
-        b.x += b.vx; b.y += b.vy;
-        if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) return false;
+        // enemies AI
+        let anyAlive = false;
+        enemiesRef.current.forEach(e => {
+          if (!e.alive) { e.deathTimer++; return; }
+          anyAlive = true;
+          const dx = p.x - e.x, dy = p.y - e.y;
+          const dist = Math.hypot(dx, dy);
+          // check visibility (simple)
+          const ray = castRay(e.x, e.y, Math.atan2(dy, dx));
+          const sees = ray.dist > dist - 0.3;
 
-        if (b.friendly) {
-          for (let i = enemiesRef.current.length - 1; i >= 0; i--) {
-            const e = enemiesRef.current[i];
-            if (rect(b.x - b.r, b.y - b.r, b.r * 2, b.r * 2, e.x, e.y, e.w, e.h)) {
-              e.hp -= b.dmg;
-              particlesRef.current.push(...makeParticles(b.x, b.y, e.color, 5));
-              if (e.hp <= 0) {
-                particlesRef.current.push(...makeParticles(e.x + e.w / 2, e.y + e.h / 2, e.color, 14));
-                p.score += e.reward;
-                p.kills++;
-                enemiesRef.current.splice(i, 1);
+          if (sees && dist < 12) {
+            // move toward player
+            if (dist > 2) {
+              const spd = 0.018;
+              const nx = e.x + (dx / dist) * spd;
+              const ny = e.y + (dy / dist) * spd;
+              if (mapAt(nx, e.y) === 0) e.x = nx;
+              if (mapAt(e.x, ny) === 0) e.y = ny;
+            }
+            e.shootTimer--;
+            if (e.shootTimer <= 0) {
+              e.shootTimer = 60 + Math.random() * 50;
+              // chance to hit
+              const hitChance = Math.max(0.15, 0.6 - dist * 0.04);
+              if (Math.random() < hitChance) {
+                const dmg = 10 + Math.floor(Math.random() * 15);
+                if (p.armor > 0) {
+                  const absorbed = Math.min(p.armor, Math.floor(dmg * 0.5));
+                  p.armor -= absorbed;
+                  p.hp -= dmg - absorbed;
+                } else {
+                  p.hp -= dmg;
+                }
+                p.hitFlash = 1;
+                setUi(u => ({ ...u, hp: Math.max(0, p.hp), armor: p.armor }));
               }
-              return false;
             }
           }
-        } else {
-          if (rect(b.x - b.r, b.y - b.r, b.r * 2, b.r * 2, p.x, p.y, p.w, p.h)) {
-            if (p.shield > 0) { p.shield = Math.max(0, p.shield - b.dmg); }
-            else { p.hp -= b.dmg; }
-            particlesRef.current.push(...makeParticles(pcx, pcy, "#4488ff", 4));
-            return false;
-          }
+        });
+
+        // next round
+        if (!anyAlive) {
+          gs.round++;
+          gs.money += 500;
+          p.hp = Math.min(100, p.hp + 25);
+          p.armor = Math.min(100, p.armor + 40);
+          p.reserve += 60;
+          spawnEnemies(gs.round);
+          setUi(u => ({ ...u, round: gs.round, money: gs.money, hp: p.hp, armor: p.armor, reserve: p.reserve,
+            enemiesLeft: enemiesRef.current.length }));
         }
-        return true;
-      });
 
-      // Update particles
-      particlesRef.current = particlesRef.current.filter(pt => {
-        pt.x += pt.vx; pt.y += pt.vy;
-        pt.vx *= 0.92; pt.vy *= 0.92;
-        pt.life--;
-        return pt.life > 0;
-      });
-
-      // Player death
-      if (p.hp <= 0) {
-        p.hp = 0;
-        particlesRef.current.push(...makeParticles(pcx, pcy, "#ff6a1a", 30));
-        gs.phase = "dead";
-        const newHs = Math.max(highScore, p.score);
-        setHighScore(newHs);
-        try { localStorage.setItem("fol_hs", String(newHs)); } catch { /* */ }
-        setUi(u => ({ ...u, phase: "dead", score: p.score }));
+        // death
+        if (p.hp <= 0) {
+          p.hp = 0;
+          gs.phase = "dead";
+          const newHk = Math.max(highKills, gs.kills);
+          setHighKills(newHk);
+          try { localStorage.setItem("fps_hk", String(newHk)); } catch { /* */ }
+          setUi(u => ({ ...u, phase: "dead", hp: 0, kills: gs.kills }));
+          if (document.pointerLockElement) document.exitPointerLock();
+        }
       }
 
-      // ── Draw ──
-      particlesRef.current.forEach(pt => {
-        ctx.globalAlpha = pt.life / pt.maxLife;
-        ctx.fillStyle = pt.color;
-        ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2); ctx.fill();
-      });
-      ctx.globalAlpha = 1;
+      // ── Render ──
+      drawSky();
+      render3D(p);
+      drawSprites(p);
+      drawWeapon(p);
+      drawCrosshair(p);
+      drawHUD(p, gs);
 
-      enemiesRef.current.forEach(drawEnemy);
-      bulletsRef.current.forEach(drawBullet);
-      drawPlayer(p, tick);
-      drawHUD(p, gs, tick);
+      if (gs.phase === "dead") drawDead(gs);
     };
 
     frameRef.current = requestAnimationFrame(loop);
@@ -719,55 +851,60 @@ export default function Index() {
       cancelAnimationFrame(frameRef.current);
       window.removeEventListener("keydown", (e) => onKey(e, true));
       window.removeEventListener("keyup", (e) => onKey(e, false));
-      canvas.removeEventListener("mousemove", onMouseMove);
       canvas.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("pointerlockchange", onLockChange);
     };
-  }, [resetGame, highScore]);
+  }, [resetGame, highKills, spawnEnemies]);
 
   return (
-    <div
-      className="min-h-screen flex flex-col items-center justify-center"
-      style={{ background: "#020408", userSelect: "none" }}
-    >
-      {/* Title bar */}
-      <div className="flex items-center justify-between w-full max-w-[800px] px-2 mb-2">
-        <div>
-          <span className="font-game text-lg tracking-widest text-white/80">FORGE</span>
-          <span className="font-game text-lg tracking-widest ml-1" style={{ color: "var(--game-orange)" }}>SHOOTER</span>
+    <div className="min-h-screen flex flex-col items-center justify-center"
+      style={{ background: "#030508", userSelect: "none" }}>
+      {/* Top bar */}
+      <div className="flex items-center justify-between w-full max-w-[960px] px-3 py-2">
+        <div className="flex items-center gap-3">
+          <div className="w-7 h-7 flex items-center justify-center rounded"
+            style={{ background: "linear-gradient(135deg,#ff6a1a,#c8963e)" }}>
+            <span className="text-black text-xs font-bold">B</span>
+          </div>
+          <div>
+            <div className="font-game text-base tracking-[0.2em] text-white/90 leading-none">BLACK SITE</div>
+            <div className="text-[9px] font-body text-white/30 tracking-[0.3em] uppercase mt-0.5">Tactical FPS · Bot Match</div>
+          </div>
         </div>
-        <div className="flex gap-4 text-xs font-body text-white/40">
-          <span>WASD — движение</span>
-          <span>ЛКМ — огонь</span>
-          <span>R — перезарядка</span>
-          <span>ПРОБЕЛ — пауза</span>
+        <div className="flex items-center gap-4 text-[10px] font-body text-white/40">
+          <span className="flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+            LIVE
+          </span>
+          <span>KILLS: <span className="text-white/80 font-bold">{ui.kills}</span></span>
+          <span>RD: <span className="text-orange-400 font-bold">{ui.round}</span></span>
+          <span className="text-white/20">|</span>
+          <span>REC: <span className="text-yellow-400">{highKills}</span></span>
         </div>
       </div>
 
       {/* Canvas */}
-      <div
-        className="relative rounded overflow-hidden"
-        style={{ boxShadow: "0 0 40px rgba(255,106,26,0.25), 0 0 80px rgba(0,0,0,0.8)", border: "1px solid rgba(255,106,26,0.2)" }}
-      >
-        <canvas
-          ref={canvasRef}
-          width={W}
-          height={H}
-          className="block"
-          style={{ maxWidth: "100%", cursor: "none", touchAction: "none" }}
-        />
+      <div className="relative rounded overflow-hidden"
+        style={{ boxShadow: "0 0 60px rgba(255,106,26,0.18), 0 0 120px rgba(0,0,0,0.9)",
+          border: "1px solid rgba(255,106,26,0.15)" }}>
+        <canvas ref={canvasRef} width={W} height={H} className="block"
+          style={{ maxWidth: "100%", cursor: "none", touchAction: "none" }} />
       </div>
 
       {/* Bottom bar */}
-      <div className="flex items-center justify-between w-full max-w-[800px] px-2 mt-2">
-        <div className="text-xs font-body text-white/20">
-          {highScore > 0 && `Рекорд: ${highScore.toLocaleString()}`}
+      <div className="flex items-center justify-between w-full max-w-[960px] px-3 py-2 text-[10px] font-body text-white/30">
+        <div className="flex gap-3">
+          <span>WASD — движение</span>
+          <span>МЫШЬ — осмотр</span>
+          <span>ЛКМ — огонь</span>
+          <span>R — перезарядка</span>
         </div>
-        <div className="flex gap-2 text-[10px] font-body text-white/20">
-          <span className="text-red-400/60">■ Базовый</span>
-          <span className="text-orange-400/60">■ Танк</span>
-          <span className="text-green-400/60">■ Быстрый</span>
-          <span className="text-red-300/60">★ Босс</span>
+        <div className="flex gap-2">
+          <span className={ui.weapon === "ak47" ? "text-orange-400" : ""}>[1] AK-47</span>
+          <span className={ui.weapon === "awp" ? "text-orange-400" : ""}>[2] AWP</span>
+          <span className={ui.weapon === "glock" ? "text-orange-400" : ""}>[3] GLOCK</span>
         </div>
       </div>
     </div>
